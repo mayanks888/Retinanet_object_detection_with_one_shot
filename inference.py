@@ -1,0 +1,239 @@
+import argparse
+from anchors import Anchors
+import torchvision.datasets as dset
+import matplotlib.pyplot as plt
+import numpy as np
+import random
+from PIL import Image
+from torch.autograd import Variable
+import PIL.ImageOps
+import torch.nn as nn
+import torch.nn.functional as F
+import time
+import cv2
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision import datasets, models, transforms
+from dataloader import CocoDataset, CSVDataset, collater, Resizer, AspectRatioBasedSampler, Augmenter, UnNormalizer, Normalizer,Normalizer_mayank_custum,Resizer_mayank_custom
+import os
+import skimage.io
+import skimage.transform
+import skimage.color
+import skimage
+# assert torch.__version__.split('.')[1] == '4'
+
+print('CUDA available: {}'.format(torch.cuda.is_available()))
+
+
+def main(args=None):
+
+
+	def imshow(img, text=None, should_save=False):
+		npimg = img.numpy()
+		plt.axis("off")
+		if text:
+			plt.text(15, 5, text, style='italic', fontweight='bold',
+					 bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 10})
+		plt.imshow(np.transpose(npimg, (1, 2, 0)))
+		# plt.imshow(np.transpose(npimg, (0, 2, 1)))
+		plt.show()
+
+
+	class SiameseNetwork(nn.Module):
+		def __init__(self):
+			super(SiameseNetwork, self).__init__()
+			self.cnn1 = nn.Sequential(
+				nn.ReflectionPad2d(1),
+				nn.Conv2d(3, 4, kernel_size=3),
+				nn.ReLU(inplace=True),
+				nn.BatchNorm2d(4),
+
+				nn.ReflectionPad2d(1),
+				nn.Conv2d(4, 8, kernel_size=3),
+				nn.ReLU(inplace=True),
+				nn.BatchNorm2d(8),
+
+				nn.ReflectionPad2d(1),
+				nn.Conv2d(8, 8, kernel_size=3),
+				nn.ReLU(inplace=True),
+				nn.BatchNorm2d(8),
+
+			)
+
+			self.fc1 = nn.Sequential(
+				nn.Linear(8 * res * res, 500),
+				nn.ReLU(inplace=True),
+
+				nn.Linear(500, 500),
+				nn.ReLU(inplace=True),
+
+				nn.Linear(500, 5))
+
+		def forward_once(self, x):
+			output = self.cnn1(x)
+			output = output.view(output.size()[0], -1)
+			output = self.fc1(output)
+			return output
+
+		def forward(self, input1, input2):
+			output1 = self.forward_once(input1)
+			output2 = self.forward_once(input2)
+			return output1, output2
+	class SiameseNetworkDataset(Dataset):
+
+		def __init__(self, imageFolderDataset, transform=None, should_invert=True):
+			self.imageFolderDataset = imageFolderDataset
+			self.transform = transform
+			self.should_invert = should_invert
+
+		def __getitem__(self, index):
+			img0_tuple = random.choice(self.imageFolderDataset.imgs)
+			# img0_tuple = random.choice(self.imageFolderDataset.samples)
+
+			img0 = Image.open(img0_tuple[0])
+			img0 = img0.convert("RGB")
+			if self.should_invert:
+				img0 = PIL.ImageOps.invert(img0)
+			# img1 = PIL.ImageOps.invert(img1)
+			if self.transform is not None:
+				img0 = self.transform(img0)
+			# return img0, img1 , torch.from_numpy(np.array([int(img1_tuple[1]!=img0_tuple[1])],dtype=np.float32))
+			label = img0_tuple[1]
+			return img0, label
+
+		def __len__(self):
+			return len(self.imageFolderDataset.imgs)
+
+	parser = argparse.ArgumentParser(description='Simple training script for training a RetinaNet network.')
+	parser.add_argument('--test_image_dir', default="./data/traffic_image_datasets", help='Path to test images')
+	parser.add_argument('--reference_image_dir', default='data/only_traffic_light/reference', help='Path to reference images')
+	parser.add_argument('--model',default='./saved_models/csv_retinanet_0.pt', help='Path to model (.pt) file.')
+	parser.add_argument('--model_siamese',default='./saved_models/model-save_dict_osl-2.pt', help='Path to simaese model (.pt) file.')
+	parser.add_argument('--top_n_roi',default=10, help='slect top n rois for one shot')
+	parser.add_argument('--siam_img_res',default=30, help='select resolution for siamese model')
+	args = parser.parse_args(args)
+
+
+	retinanet = torch.load(args.model)
+	use_gpu = True
+
+	if use_gpu:
+		retinanet = retinanet.cuda()
+
+	retinanet.eval()
+
+	unnormalize = UnNormalizer()
+	def draw_caption(image, box, caption):
+		b = np.array(box).astype(int)
+		cv2.putText(image, caption, (b[0], b[1] - 10), cv2.FONT_HERSHEY_PLAIN, 1, (0, 0, 0), 2)
+		cv2.putText(image, caption, (b[0], b[1] - 10), cv2.FONT_HERSHEY_PLAIN, 1, (255, 255, 255), 1)
+	########################################################33
+	# this is dataloading respect to siamese network
+		# reference datasets
+	# image_resolution
+	res = args.siam_img_res
+	folder_dataset = dset.ImageFolder(root=args.reference_image_dir)
+	ref_batch=folder_dataset.imgs.__len__()
+	siamese_dataset = SiameseNetworkDataset(imageFolderDataset=folder_dataset, transform=transforms.Compose(
+		[transforms.Resize((res, res)), transforms.ToTensor()]), should_invert=False)
+	vis_dataloader = DataLoader(siamese_dataset, shuffle=True, num_workers=8, batch_size=ref_batch)
+	dataiter = iter(vis_dataloader)
+	reference_batch = next(dataiter)
+
+	net = SiameseNetwork().cuda()
+	net.load_state_dict(torch.load(args.model_siamese))
+	net.eval()
+	# color = ['black', 'green', 'red', 'yellow']
+
+	input_folder=args.test_image_dir
+	root=''
+	for root, _, filenames in os.walk(input_folder):
+		if (len(filenames) == 0):
+			print("Input folder is empty")
+			return 1
+		time_start = time.time()
+		for filename in filenames:
+			file_path = (os.path.join(root, filename));
+			img = skimage.io.imread(file_path)
+			img=img.astype(np.float32) / 255.0
+
+			transform = transforms.Compose([Normalizer_mayank_custum(), Resizer_mayank_custom()])
+			data = transform(img)
+			data=data['img']
+			# data=torch.transpose(data,2,0)
+			data=data.permute(2, 0, 1)
+			data = data.unsqueeze(0)
+
+			with torch.no_grad():
+				print('********************************************************\n')
+				st = time.time()
+				scores, classification, transformed_anchors = retinanet(data.cuda().float())
+				# print('Elapsed time: {}'.format((time.time()-st)*1000))
+				print('Elapsed time detection: ',((time.time()-st)*1000))
+				idxs = np.where(scores>0.001)
+				img = np.array(255 * unnormalize(data[0, :, :, :])).copy()
+				img[img<0] = 00
+				img[img>255] = 255
+
+				img = np.transpose(img, (1, 2, 0))
+				img = cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_BGR2RGB)
+			#############################
+			for j in range(idxs[0].shape[0]):
+				bbox = transformed_anchors[idxs[0][j], :]
+			# bbox=transformed_anchors.data[0,:]
+				x1 = int(bbox[0])
+				y1 = int(bbox[1])
+				x2 = int(bbox[2])
+				y2 = int(bbox[3])
+				#current cropping only one roi
+				break
+
+			if idxs[0].shape[0]==0:
+				# print(0)
+				continue
+
+###############################################################3
+			# here I am adding siamese network
+
+			frame = img[int(y1):int(y2), int(x1):int(x2)]
+			cv2.imwrite("myimage.jpg",frame)
+			# ################################33
+			img0 = Image.open("myimage.jpg")
+			img0 = img0.convert("RGB")
+			transform = transforms.Compose([transforms.Resize((30, 30)), transforms.ToTensor()])
+			img0 = transform(img0)
+			input_batch = img0.repeat(ref_batch, 1, 1, 1)
+			############################
+			t1 = time.time()
+			output1, output2 = net(Variable(input_batch).cuda(), Variable(reference_batch[0]).cuda())
+			# print("actual time taken", (time.time() - t1) * 1000)
+			euclidean_distance = F.pairwise_distance(output1, output2)
+			values_mx, indices_mx = euclidean_distance.max(0)
+			values_mn, indices_mn = euclidean_distance.min(0)
+			# print(values_mn,indices_mn)
+			dismalirty = float(values_mn)
+			# light_color = color[reference_batch[1][indices_mn]]
+			light_color = folder_dataset.classes[int(reference_batch[1][indices_mn])]
+			print('Elapsed time with osl: ', ((time.time() - st) * 1000))
+	############################################################################################
+			for index,j in enumerate(range(idxs[0].shape[0])):
+				bbox = transformed_anchors[idxs[0][j], :]
+				x1 = int(bbox[0])
+				y1 = int(bbox[1])
+				x2 = int(bbox[2])
+				y2 = int(bbox[3])
+				# label_name = dataset_val.labels[int(classification[idxs[0][j]])]
+				draw_caption(img, (x1, y1, x2, y2), light_color)
+				cv2.rectangle(img, (x1, y1), (x2, y2), color=(0, 0, 255), thickness=2)
+				# print(label_name)
+				#select top ten image
+				if index>args.top_n_roi:
+					break
+			# print(1)
+			cv2.imshow('img', img)
+			cv2.waitKey(1000)
+			cv2.destroyAllWindows()
+
+
+if __name__ == '__main__':
+ main()
